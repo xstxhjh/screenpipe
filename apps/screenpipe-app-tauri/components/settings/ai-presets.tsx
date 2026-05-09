@@ -580,6 +580,18 @@ const AISection = ({
     setTestResults(INITIAL_DIAGNOSTICS);
     setDiagnosticsOpen(true);
 
+    const safeFail = (message: string) => {
+      setTestResults({
+        endpoint: { status: "fail", message },
+        auth: { status: "skip", message: "Skipped" },
+        models: { status: "skip", message: "Skipped" },
+        chat: { status: "skip", message: "Skipped" },
+      });
+      setTestStatus("done");
+    };
+
+    try {
+
     const skipRemaining = (failStep: keyof DiagnosticResults, message: string) => {
       setTestResults((prev) => ({
         ...prev,
@@ -649,9 +661,8 @@ const AISection = ({
         chat: { status: "running", message: "Sending test message..." },
       }));
     } else {
-      // Local custom providers often do not implement browser CORS preflight on /models.
       const modelsFetchFn =
-        settingsPreset?.provider === "custom" && isLocalhostUrl(settingsPreset?.url)
+        settingsPreset?.provider === "custom"
           ? tauriFetch
           : fetch;
       try {
@@ -785,8 +796,7 @@ const AISection = ({
       chatHeaders["OpenAI-Beta"] = "responses=experimental";
     }
 
-    // Use tauriFetch for chatgpt.com and Anthropic to bypass CORS
-    const fetchFn = (isChatGpt || isAnthropic) ? tauriFetch : fetch;
+    const fetchFn = (isChatGpt || isAnthropic || settingsPreset?.provider === "custom") ? tauriFetch : fetch;
 
     const chatStart = performance.now();
     try {
@@ -870,6 +880,10 @@ const AISection = ({
     }
 
     setTestStatus("done");
+    } catch (err: any) {
+      if (abort.signal.aborted) return;
+      safeFail(`Diagnostics failed: ${err.message || "Unknown error"}`);
+    }
   }, [settingsPreset?.provider, settingsPreset?.url, settingsPreset?.apiKey, settingsPreset?.model]);
 
   const isApiKeyRequired =
@@ -924,7 +938,7 @@ const AISection = ({
           break;
         case "custom":
           try {
-            const customFetchFn = isLocalhostUrl(settingsPreset?.url) ? tauriFetch : fetch;
+            const customFetchFn = tauriFetch;
             const customResponse = await customFetchFn(
               `${settingsPreset?.url}/models`,
               {
@@ -1124,7 +1138,9 @@ const AISection = ({
 
     if (settingsPreset.provider === "openai-chatgpt" || settingsPreset.provider === "native-ollama" || settingsPreset.url) {
       const timer = setTimeout(() => {
-        runDiagnostics();
+        runDiagnostics().catch((err) => {
+          console.error("runDiagnostics error:", err);
+        });
       }, 1000);
       return () => clearTimeout(timer);
     }
@@ -1691,7 +1707,7 @@ const AISection = ({
               <Button
                 variant="outline"
                 size="sm"
-                onClick={runDiagnostics}
+                onClick={() => { runDiagnostics().catch((err) => { console.error("runDiagnostics error:", err); }); }}
                 disabled={testStatus === "testing"}
                 className="flex items-center gap-2"
               >
