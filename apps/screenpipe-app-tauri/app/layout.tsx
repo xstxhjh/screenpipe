@@ -261,6 +261,112 @@ export default function RootLayout({
             `,
           }}
         />
+        <style dangerouslySetInnerHTML={{ __html: `
+          #translate {
+            position: fixed !important;
+            top: 12px !important;
+            right: 12px !important;
+            left: auto !important;
+            z-index: 999999 !important;
+            width: 22px !important;
+            height: 22px !important;
+            overflow: hidden !important;
+            border-radius: 50% !important;
+            background: rgba(0,0,0,0.35) !important;
+            backdrop-filter: blur(4px) !important;
+            box-shadow: none !important;
+            padding: 0 !important;
+            cursor: pointer !important;
+            transition: width 0.3s ease, border-radius 0.3s ease, background 0.2s !important;
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+          }
+          #translate::before {
+            content: "\\1F310" !important;
+            font-size: 11px !important;
+            line-height: 22px !important;
+            text-align: center !important;
+            flex-shrink: 0 !important;
+            pointer-events: none !important;
+          }
+          #translate select {
+            position: absolute !important;
+            left: 0 !important;
+            top: 0 !important;
+            width: 100% !important;
+            height: 100% !important;
+            opacity: 0 !important;
+            cursor: pointer !important;
+            font-size: 0 !important;
+          }
+          #translate:hover {
+            width: 100px !important;
+            border-radius: 11px !important;
+            background: rgba(0,0,0,0.55) !important;
+            padding: 0 8px !important;
+          }
+          #translate:hover::before { display: none !important; }
+          #translate:hover select {
+            opacity: 1 !important;
+            position: relative !important;
+            font-size: 12px !important;
+            background: transparent !important;
+            color: #fff !important;
+            border: none !important;
+            outline: none !important;
+            padding: 0 !important;
+          }
+          #translate select option { color: #000 !important; background: #fff !important; }
+          .dark #translate {
+            background: rgba(255,255,255,0.1) !important;
+          }
+          .dark #translate:hover {
+            background: rgba(255,255,255,0.2) !important;
+          }
+        `}} />
+        <script src="https://res.zvo.cn/translate/translate.js" defer></script>
+        <script
+          dangerouslySetInnerHTML={{
+            __html: `
+              (function() {
+                window.addEventListener('error', function(e) {
+                  if (e.message && (e.message.indexOf('translate') !== -1 || e.message.indexOf('Translation') !== -1)) { e.preventDefault(); }
+                });
+                window.addEventListener('unhandledrejection', function(e) {
+                  var msg = String(e.reason && e.reason.message || e.reason || '');
+                  if (msg.indexOf('translate') !== -1 || msg.indexOf('Translation') !== -1) { e.preventDefault(); }
+                });
+                function initTranslate() {
+                  if (typeof translate === 'undefined') {
+                    setTimeout(initTranslate, 500);
+                    return;
+                  }
+                  try {
+                    translate.storage.set('to','');
+                    translate.selectLanguageTag.selectOnChange = function(event){
+                      var isReload = translate.to != null && translate.to.length > 0;
+                      if(!isReload){
+                        var language = event.target.value;
+                        translate.changeLanguage(language);
+                      }
+                    };
+                    translate.service.use('client.edge');
+                    translate.listener.start();
+                    translate.execute();
+                  } catch(e) {
+                    console.warn('[translate] init error:', e);
+                  }
+                }
+                if(document.readyState === 'complete'){
+                  setTimeout(initTranslate, 500);
+                } else {
+                  window.addEventListener('load', function(){ setTimeout(initTranslate, 500); });
+                }
+              })();
+            `,
+          }}
+        />
       </head>
       <Providers>
         <body className={`${inter.className} scrollbar-hide ${isSearch ? "bg-transparent" : ""}`}>
