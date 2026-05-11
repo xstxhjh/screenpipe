@@ -13,13 +13,13 @@
 //!
 //! ## Weight file
 //!
-//! MLX consumes safetensors, not ONNX. Until we publish a safetensors
-//! sibling next to `rfdetr_v9.onnx` on HuggingFace, this adapter
-//! expects the file at `~/.screenpipe/models/rfdetr_v9.safetensors`
-//! (use `convert/onnx_to_mlx.py` from the model release to produce
-//! it). If the file is missing, [`RfdetrMlxRedactor::load`] returns
-//! [`RedactError::Unavailable`] so the engine can fall back to the
-//! ONNX path cleanly.
+//! MLX consumes safetensors, not ONNX, so this adapter ships its own
+//! download flow (mirroring [`super::rfdetr::RfdetrConfig`]): pulls
+//! `rfdetr_v9.safetensors` from
+//! `huggingface.co/screenpipe/pii-image-redactor` on first run
+//! (~108 MB), verifies SHA-256, atomic-renames into
+//! `~/.screenpipe/models/rfdetr_v9.safetensors`. Subsequent starts
+//! are instant.
 
 use std::path::{Path, PathBuf};
 
@@ -27,11 +27,53 @@ use async_trait::async_trait;
 
 use crate::image::{ImageRedactor, ImageRegion};
 use crate::RedactError;
-#[cfg(all(feature = "mlx-mac", target_os = "macos"))]
+#[cfg(all(feature = "mlx-mac", target_os = "macos", target_arch = "aarch64"))]
 use crate::SpanLabel;
 
 const NAME: &str = "rfdetr-mlx";
 const VERSION: u32 = 9; // tracks rfdetr_v9 weights
+
+/// Minimum macOS major version that's safe for MLX at runtime.
+///
+/// Mirrors `screenpipe_config::PARAKEET_MIN_MACOS_MAJOR` — mlx-sys's
+/// pre-compiled `.metallib` uses Metal 3.2+ features (simdgroup_matrix
+/// kernels) that segfault during Metal init on older macOS. The
+/// build-time deployment target gate (14.0) lets the binary *launch*
+/// on macOS 14+; this runtime gate prevents us from actually invoking
+/// MLX on anything below 26.
+const MIN_MACOS_MAJOR: u32 = 26;
+
+/// Returns true iff this host can safely run MLX at runtime.
+///
+/// On macOS aarch64, shells out to `sw_vers -productVersion` and
+/// gates on [`MIN_MACOS_MAJOR`] — same shape as
+/// `screenpipe_config::macos_major_version`, inlined here so this
+/// crate doesn't pick up screenpipe-config just for one fn. On any
+/// other platform this always returns `false` — the cfg gates
+/// elsewhere keep the rest of the module from compiling, but having
+/// this fn always callable simplifies the public API.
+fn is_runtime_supported() -> bool {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        macos_major_version()
+            .map(|v| v >= MIN_MACOS_MAJOR)
+            .unwrap_or(false)
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        false
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn macos_major_version() -> Option<u32> {
+    let output = std::process::Command::new("sw_vers")
+        .arg("-productVersion")
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&output.stdout);
+    s.trim().split('.').next()?.parse().ok()
+}
 
 /// Configuration for [`RfdetrMlxRedactor`].
 #[derive(Debug, Clone)]
@@ -63,11 +105,122 @@ impl RfdetrMlxConfig {
             .join("models")
             .join("rfdetr_v9.safetensors")
     }
+
+    /// HuggingFace download URL for the safetensors weights. Pinned to
+    /// `main` so a model bump goes through a deliberate code change
+    /// (URL + expected SHA-256 + [`VERSION`] all bumped together).
+    pub const HF_DOWNLOAD_URL: &'static str =
+        "https://huggingface.co/screenpipe/pii-image-redactor/resolve/main/rfdetr_v9.safetensors";
+
+    /// Expected SHA-256 of the canonical `rfdetr_v9.safetensors`.
+    /// Verified after every download. If a future training run
+    /// produces a new best, bump [`VERSION`], re-publish to HF,
+    /// update this constant.
+    pub const EXPECTED_SHA256: &'static str =
+        "6afe6974653a68a2d56efe74c13adfa6b54dd8d0cf43b8eb0603c85e0884b6e6";
+
+    /// Make sure the safetensors is present on disk. Idempotent —
+    /// does nothing if [`Self::model_path`] already exists with the
+    /// expected SHA-256. Otherwise downloads from
+    /// [`Self::HF_DOWNLOAD_URL`], verifies, atomic-renames into place.
+    ///
+    /// Atomic semantics: download lands at
+    /// `<model_path>.partial`, gets verified, then renames over
+    /// `<model_path>`. A killed process leaves at most a `.partial`
+    /// that the next call cleans up.
+    ///
+    /// Returns [`RedactError::Unavailable`] without touching the disk
+    /// if the host macOS is too old for MLX at runtime (see
+    /// [`is_runtime_supported`]) — the engine falls through to the
+    /// ONNX adapter cleanly, and we don't waste a 108 MB download on
+    /// a machine that can't use it.
+    pub async fn ensure_model_present(&self) -> Result<(), RedactError> {
+        if !is_runtime_supported() {
+            return Err(RedactError::Unavailable(format!(
+                "rfdetr-mlx requires macOS {MIN_MACOS_MAJOR}+ at runtime; \
+                 fall through to the ONNX adapter"
+            )));
+        }
+        if self.model_path.exists() && Self::sha256_matches(&self.model_path)? {
+            return Ok(());
+        }
+
+        if let Some(parent) = self.model_path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| RedactError::Runtime(format!("mkdir {}: {e}", parent.display())))?;
+        }
+
+        let tmp = self.model_path.with_extension("safetensors.partial");
+        let _ = tokio::fs::remove_file(&tmp).await;
+
+        tracing::info!(
+            url = Self::HF_DOWNLOAD_URL,
+            target = %self.model_path.display(),
+            "downloading rfdetr_v9.safetensors (~108 MB) — first-run only"
+        );
+        let resp = reqwest::Client::new()
+            .get(Self::HF_DOWNLOAD_URL)
+            .send()
+            .await
+            .map_err(|e| RedactError::Runtime(format!("rfdetr-mlx download GET: {e}")))?;
+        if !resp.status().is_success() {
+            return Err(RedactError::Runtime(format!(
+                "rfdetr-mlx download returned {}",
+                resp.status()
+            )));
+        }
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| RedactError::Runtime(format!("rfdetr-mlx download body: {e}")))?;
+
+        let actual = Self::hex_sha256(&bytes);
+        if actual != Self::EXPECTED_SHA256 {
+            return Err(RedactError::Runtime(format!(
+                "rfdetr-mlx download checksum mismatch: got {}, want {}",
+                actual,
+                Self::EXPECTED_SHA256
+            )));
+        }
+
+        tokio::fs::write(&tmp, &bytes)
+            .await
+            .map_err(|e| RedactError::Runtime(format!("rfdetr-mlx write tmp: {e}")))?;
+        tokio::fs::rename(&tmp, &self.model_path)
+            .await
+            .map_err(|e| RedactError::Runtime(format!("rfdetr-mlx rename: {e}")))?;
+        tracing::info!(
+            target = %self.model_path.display(),
+            bytes = bytes.len(),
+            "rfdetr_v9.safetensors ready"
+        );
+        Ok(())
+    }
+
+    fn hex_sha256(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        let digest = hasher.finalize();
+        let mut s = String::with_capacity(64);
+        for b in digest {
+            use std::fmt::Write;
+            let _ = write!(&mut s, "{b:02x}");
+        }
+        s
+    }
+
+    fn sha256_matches(path: &Path) -> Result<bool, RedactError> {
+        let bytes = std::fs::read(path)
+            .map_err(|e| RedactError::Runtime(format!("read {}: {e}", path.display())))?;
+        Ok(Self::hex_sha256(&bytes) == Self::EXPECTED_SHA256)
+    }
 }
 
 // ─── feature-on path: real implementation ─────────────────────────
 
-#[cfg(all(feature = "mlx-mac", target_os = "macos"))]
+#[cfg(all(feature = "mlx-mac", target_os = "macos", target_arch = "aarch64"))]
 mod imp {
     use super::*;
     use std::sync::Mutex;
@@ -100,13 +253,18 @@ mod imp {
 
     impl RfdetrMlxRedactor {
         /// Sync constructor. Returns [`RedactError::Unavailable`] if
-        /// the safetensors file is missing — caller can fall back to
-        /// the ONNX adapter.
+        /// the safetensors file is missing or the host macOS is too
+        /// old for MLX — caller can fall back to the ONNX adapter.
         pub fn load(cfg: RfdetrMlxConfig) -> Result<Self, RedactError> {
+            if !is_runtime_supported() {
+                return Err(RedactError::Unavailable(format!(
+                    "rfdetr-mlx requires macOS {MIN_MACOS_MAJOR}+ at runtime"
+                )));
+            }
             if !cfg.model_path.exists() {
                 return Err(RedactError::Unavailable(format!(
                     "rfdetr-mlx safetensors not found at {} \
-                     (convert from rfdetr_v9.onnx via convert/onnx_to_mlx.py)",
+                     (download via RfdetrMlxConfig::ensure_model_present)",
                     cfg.model_path.display()
                 )));
             }
@@ -176,17 +334,17 @@ mod imp {
     }
 }
 
-#[cfg(all(feature = "mlx-mac", target_os = "macos"))]
+#[cfg(all(feature = "mlx-mac", target_os = "macos", target_arch = "aarch64"))]
 pub use imp::RfdetrMlxRedactor;
 
 // ─── feature-off path: stub ──────────────────────────────────────
 
-#[cfg(not(all(feature = "mlx-mac", target_os = "macos")))]
+#[cfg(not(all(feature = "mlx-mac", target_os = "macos", target_arch = "aarch64")))]
 pub struct RfdetrMlxRedactor {
     _cfg: RfdetrMlxConfig,
 }
 
-#[cfg(not(all(feature = "mlx-mac", target_os = "macos")))]
+#[cfg(not(all(feature = "mlx-mac", target_os = "macos", target_arch = "aarch64")))]
 impl RfdetrMlxRedactor {
     pub fn load(_cfg: RfdetrMlxConfig) -> Result<Self, RedactError> {
         Err(RedactError::Unavailable(
@@ -195,7 +353,7 @@ impl RfdetrMlxRedactor {
     }
 }
 
-#[cfg(not(all(feature = "mlx-mac", target_os = "macos")))]
+#[cfg(not(all(feature = "mlx-mac", target_os = "macos", target_arch = "aarch64")))]
 #[async_trait]
 impl ImageRedactor for RfdetrMlxRedactor {
     fn name(&self) -> &str {
