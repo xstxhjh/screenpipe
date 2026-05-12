@@ -59,6 +59,7 @@ mod owned_browser;
 // injects via WKHTTPCookieStore; other platforms compile to a stub
 // `cookies_for_host` that returns empty until Windows (DPAPI + AES-256-
 // GCM + WebView2) and Linux (libsecret + webkit2gtk) readers land.
+mod monitor_events;
 mod owned_browser_cookies;
 mod permission_events;
 mod permissions;
@@ -591,6 +592,23 @@ async fn main() {
             .location()
             .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
             .unwrap_or_default();
+
+        // Suppress "tokio context being shutdown" panics from background
+        // tasks (redact workers, etc.) — these fire when a task is mid-
+        // sqlx/timer poll at the moment the runtime tears down on app
+        // quit. ServerCore::shutdown signals workers to exit cleanly, but
+        // a residual race is possible if the worker is inside an await
+        // that doesn't include the shutdown future. Either way, this is
+        // orderly-shutdown noise — not a crash — and logging it to
+        // last-panic.log + Sentry makes the app look unstable to users
+        // and skews crash-rate dashboards.
+        if payload.contains("Tokio 1.x context was found, but it is being shutdown") {
+            eprintln!(
+                "(suppressed tokio shutdown-time panic on thread '{}' at {})",
+                thread_name, location
+            );
+            return;
+        }
 
         // Force-capture a backtrace before abort() kills us
         let backtrace = std::backtrace::Backtrace::force_capture();
@@ -1861,6 +1879,8 @@ async fn main() {
                     sleep(Duration::from_millis(500)).await;
                 }
             });
+
+            crate::monitor_events::start(app_handle.clone());
 
             #[cfg(target_os = "macos")]
             crate::window::reset_to_regular_and_refresh_tray(&app_handle);

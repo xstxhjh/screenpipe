@@ -10,6 +10,7 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Dialog, DialogClose, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Download, ExternalLink, Check, Loader2, Copy, Terminal, Lock, LogIn, LogOut, Send, X, HelpCircle, Search, Calendar as CalendarIcon, Eye, EyeOff, FolderOpen } from "lucide-react";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { commands } from "@/lib/utils/tauri";
@@ -91,8 +92,10 @@ async function findClaudeExeOnWindows(): Promise<string | null> {
 
 import {
   getClaudeConfigPath,
+  getCodexConfigPath,
   getCursorMcpConfigPath,
   getInstalledMcpVersion,
+  isCodexMcpInstalled,
   isCursorMcpInstalled,
 } from "@/lib/hooks/use-hardcoded-tiles";
 
@@ -140,6 +143,64 @@ async function installCursorMcp(): Promise<void> {
   if (!config.mcpServers || typeof config.mcpServers !== "object") config.mcpServers = {};
   (config.mcpServers as Record<string, unknown>).screenpipe = await buildMcpConfig();
   await writeFile(configPath, new TextEncoder().encode(JSON.stringify(config, null, 2)));
+}
+
+const CODEX_SCREENPIPE_TABLE = /(?:^|\n)\[mcp_servers\.screenpipe\][\s\S]*?(?=\n\[(?!mcp_servers\.screenpipe(?:\.|\]))[^\]]+\]|\s*$)/;
+
+function tomlString(value: string): string {
+  return JSON.stringify(value);
+}
+
+function tomlKey(value: string): string {
+  return /^[A-Za-z0-9_-]+$/.test(value) ? value : tomlString(value);
+}
+
+function removeCodexMcpConfig(content: string): string {
+  return content
+    .replace(CODEX_SCREENPIPE_TABLE, "")
+    .replace(/^\n+/, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trimEnd();
+}
+
+function buildCodexMcpToml(config: McpCommand): string {
+  const lines = [
+    "[mcp_servers.screenpipe]",
+    `command = ${tomlString(config.command)}`,
+    `args = [${config.args.map(tomlString).join(", ")}]`,
+    "enabled = true",
+  ];
+
+  const envEntries = Object.entries(config.env ?? {});
+  if (envEntries.length > 0) {
+    lines.push("", "[mcp_servers.screenpipe.env]");
+    for (const [key, value] of envEntries) {
+      lines.push(`${tomlKey(key)} = ${tomlString(value)}`);
+    }
+  }
+
+  return lines.join("\n");
+}
+
+async function installCodexMcp(): Promise<void> {
+  const configPath = await getCodexConfigPath();
+  let existing = "";
+  try { existing = await readTextFile(configPath); } catch { /* fresh */ }
+
+  const config = await buildMcpConfig();
+  const withoutScreenpipe = removeCodexMcpConfig(existing);
+  const next = `${withoutScreenpipe}${withoutScreenpipe ? "\n\n" : ""}${buildCodexMcpToml(config)}\n`;
+
+  await mkdir(await dirname(configPath), { recursive: true });
+  await writeFile(configPath, new TextEncoder().encode(next));
+}
+
+async function uninstallCodexMcp(): Promise<void> {
+  const configPath = await getCodexConfigPath();
+  let existing = "";
+  try { existing = await readTextFile(configPath); } catch { return; }
+  const next = removeCodexMcpConfig(existing);
+  await writeFile(configPath, new TextEncoder().encode(next ? `${next}\n` : ""));
 }
 
 // ---------------------------------------------------------------------------
@@ -195,6 +256,7 @@ export function IntegrationIcon({ icon }: { icon: string }) {
   const icons: Record<string, React.ReactNode> = {
     claude: <ClaudeLogo />,
     cursor: <CursorLogo className="w-5 h-5 rounded" />,
+    codex: <img src="/images/codex.svg" alt="Codex" className="w-5 h-5 rounded" />,
     "claude-code": <Terminal className="h-5 w-5" />,
     warp: <img src="/images/warp.png" alt="Warp" className="w-5 h-5 rounded" />,
     chatgpt: <img src="/images/openai.png" alt="ChatGPT" className="w-5 h-5 rounded" />,
@@ -609,6 +671,76 @@ function CursorPanel({ onConnected, onDisconnected }: { onConnected?: () => void
           <ExternalLink className="h-3 w-3" />open cursor
         </Button>
       </div>
+    </div>
+  );
+}
+
+function CodexPanel({ onConnected, onDisconnected }: { onConnected?: () => void; onDisconnected?: () => void }) {
+  const [state, setState] = useState<"idle" | "installing" | "installed">("idle");
+  useEffect(() => { isCodexMcpInstalled().then(ok => { if (ok) setState("installed"); }); }, []);
+
+  const manualConfig = useMemo(() => buildCodexMcpToml({
+    command: "npx",
+    args: ["-y", "screenpipe-mcp@latest"],
+  }), []);
+
+  const handleConnect = async () => {
+    try {
+      setState("installing");
+      await installCodexMcp();
+      setState("installed");
+      onConnected?.();
+    } catch (error) {
+      console.error("failed to install codex mcp:", error);
+      await message(
+        "Failed to write Codex MCP config.\n\nManually add a [mcp_servers.screenpipe] block to ~/.codex/config.toml with command npx and args [\"-y\", \"screenpipe-mcp@latest\"].",
+        { title: "Codex MCP Setup", kind: "error" }
+      );
+      setState("idle");
+    }
+  };
+
+  const handleDisconnect = async () => {
+    try { await uninstallCodexMcp(); } catch (e) { console.warn("codex config remove failed:", e); }
+    setState("idle");
+    onDisconnected?.();
+  };
+
+  const openCodex = async () => {
+    try {
+      const os = platform();
+      if (os === "macos") await Command.create("open", ["-a", "Codex"]).execute();
+      else if (os === "windows") await Command.create("cmd", ["/c", "start", "", "Codex"]).execute();
+      else await openUrl("https://chatgpt.com/codex");
+    } catch { await openUrl("https://chatgpt.com/codex"); }
+  };
+
+  return (
+    <div className="space-y-3">
+      <p className="text-xs text-muted-foreground">Give Codex access to your screen &amp; audio history via MCP.</p>
+      <div className="flex flex-wrap gap-2">
+        {state === "installed" ? (
+          <Button onClick={handleDisconnect} variant="outline" size="sm" className="gap-1.5 h-7 text-xs normal-case font-sans tracking-normal">
+            <LogOut className="h-3 w-3" />disconnect
+          </Button>
+        ) : (
+          <Button onClick={handleConnect} disabled={state === "installing"} size="sm" className="gap-1.5 h-7 text-xs normal-case font-sans tracking-normal">
+            {state === "installing" ? (<><Loader2 className="h-3 w-3 animate-spin" />connecting...</>) : (<><Download className="h-3 w-3" />connect</>)}
+          </Button>
+        )}
+        <Button variant="outline" onClick={openCodex} size="sm" className="gap-1.5 h-7 text-xs normal-case font-sans tracking-normal">
+          <ExternalLink className="h-3 w-3" />open codex
+        </Button>
+      </div>
+      {state === "installed" && (
+        <p className="text-xs text-muted-foreground">
+          <strong>connected!</strong> open a new Codex session and ask: &quot;what did I do in the last 5 minutes?&quot;
+        </p>
+      )}
+      <details className="text-xs text-muted-foreground">
+        <summary className="cursor-pointer">manual config</summary>
+        <pre className="mt-2 bg-muted border border-border rounded-lg p-3 text-xs font-mono text-foreground overflow-x-auto whitespace-pre-wrap">{manualConfig}</pre>
+      </details>
     </div>
   );
 }
@@ -1687,23 +1819,23 @@ function ApiIntegrationPanel({ integration, onRefresh, onDisconnected }: {
 
 export function ConnectionsSection() {
   const [search, setSearch] = useState("");
-  const [selected, setSelected] = useState<string | null>(() => {
-    if (typeof window === "undefined") return null;
-    const pending = sessionStorage.getItem("openConnection");
-    if (pending) {
-      sessionStorage.removeItem("openConnection");
-      return pending;
-    }
-    return null;
-  });
+  const [selected, setSelected] = useState<string | null>(null);
   const [integrations, setIntegrations] = useState<IntegrationInfo[]>([]);
   const [integrationsLoaded, setIntegrationsLoaded] = useState(false);
 
   const os = typeof window !== "undefined" ? platform() : "";
 
+  useEffect(() => {
+    const pending = sessionStorage.getItem("openConnection");
+    if (!pending) return;
+    sessionStorage.removeItem("openConnection");
+    setSelected(pending);
+  }, []);
+
   // Hardcoded connection status
   const [claudeInstalled, setClaudeInstalled] = useState(false);
   const [cursorInstalled, setCursorInstalled] = useState(false);
+  const [codexInstalled, setCodexInstalled] = useState(false);
   const [chatgptConnected, setChatgptConnected] = useState(false);
   const [calendarUserDisconnected, setCalendarUserDisconnected] = useState(false);
   const [googleCalendarConnected, setGoogleCalendarConnected] = useState(false);
@@ -1726,6 +1858,7 @@ export function ConnectionsSection() {
       setClaudeInstalled(localStorage.getItem("screenpipe_claude_connected") === "true");
     });
     isCursorMcpInstalled().then(setCursorInstalled).catch(() => {});
+    isCodexMcpInstalled().then(setCodexInstalled).catch(() => {});
     commands.chatgptOauthStatus().then(res => {
       setChatgptConnected(res.status === "ok" && res.data.logged_in);
     }).catch(() => {});
@@ -1778,6 +1911,7 @@ export function ConnectionsSection() {
     const hardcoded: ConnectionTile[] = [
       { id: "claude", name: "Claude Desktop", icon: "claude", connected: claudeInstalled },
       { id: "cursor", name: "Cursor", icon: "cursor", connected: cursorInstalled },
+      { id: "codex", name: "Codex", icon: "codex", connected: codexInstalled },
       { id: "claude-code", name: "Claude Code", icon: "claude-code", connected: false },
       { id: "warp", name: "Warp", icon: "warp", connected: false },
       { id: "chatgpt", name: "ChatGPT", icon: "chatgpt", connected: chatgptConnected },
@@ -1823,7 +1957,7 @@ export function ConnectionsSection() {
     const googleCalTile = hardcoded.find(h => h.id === "google-calendar");
     if (googleCalTile) googleCalTile.connected = googleCalendarConnected;
     return [...hardcoded, ...apiTiles];
-  }, [os, claudeInstalled, cursorInstalled, chatgptConnected, integrations, calendarUserDisconnected, googleCalendarConnected]);
+  }, [os, claudeInstalled, cursorInstalled, codexInstalled, chatgptConnected, integrations, calendarUserDisconnected, googleCalendarConnected]);
 
   const filtered = useMemo(() => {
     if (!search.trim()) return allTiles;
@@ -1843,6 +1977,10 @@ export function ConnectionsSection() {
       case "cursor": return <CursorPanel
         onConnected={() => setCursorInstalled(true)}
         onDisconnected={() => setCursorInstalled(false)}
+      />;
+      case "codex": return <CodexPanel
+        onConnected={() => setCodexInstalled(true)}
+        onDisconnected={() => setCodexInstalled(false)}
       />;
       case "claude-code": return <ClaudeCodePanel />;
       case "chatgpt": return <ChatGptPanel />;
@@ -1916,13 +2054,6 @@ export function ConnectionsSection() {
   };
 
   const selectedTile = allTiles.find(t => t.id === selected);
-  const panelRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (selected && panelRef.current) {
-      panelRef.current.scrollIntoView({ behavior: "smooth", block: "nearest" });
-    }
-  }, [selected]);
 
   return (
     <div className="space-y-5">
@@ -1963,33 +2094,48 @@ export function ConnectionsSection() {
         )}
       </div>
 
-      {/* Expanded panel */}
-      {selected && selectedTile && (() => {
-        const standaloneIds = ["browser-url", "voice-memos", "apple-intelligence", "apple-calendar", "google-calendar", "google-docs", "gmail", "ics-calendar", "openclaw", "hermes"];
-        if (standaloneIds.includes(selected)) {
-          // These components render their own Card
-          return <div ref={panelRef}>{renderPanel()}</div>;
-        }
-        return (
-          <Card ref={panelRef} className="border-border bg-card">
-            <CardContent className="p-4">
-              <div className="flex items-center gap-3 mb-4">
+      <Dialog
+        open={!!selected && !!selectedTile}
+        onOpenChange={(open) => {
+          if (!open) setSelected(null);
+        }}
+      >
+        <DialogContent
+          className="max-w-3xl max-h-[85vh] overflow-y-auto p-0 gap-0"
+          overlayClassName="bg-black/50 backdrop-blur-sm"
+          hideCloseButton
+          aria-describedby={undefined}
+        >
+          {selected && selectedTile && (
+            <>
+              <DialogHeader className="flex-row items-center gap-3 space-y-0 border-b border-border p-4 pr-12 text-left">
                 <IntegrationIcon icon={selectedTile.icon} />
-                <div>
-                  <h3 className="text-sm font-semibold text-foreground">{selectedTile.name}</h3>
+                <div className="min-w-0">
+                  <DialogTitle className="text-sm font-semibold font-sans normal-case">
+                    {selectedTile.name}
+                  </DialogTitle>
                   {selectedTile.connected && (
                     <span className="text-xs text-foreground">connected</span>
                   )}
                 </div>
-                <button onClick={() => setSelected(null)} className="ml-auto text-muted-foreground hover:text-foreground">
-                  <X className="h-4 w-4" />
-                </button>
+                <DialogClose asChild>
+                  <button
+                    type="button"
+                    aria-label="close"
+                    className="ml-auto text-muted-foreground transition-colors hover:text-foreground"
+                  >
+                    <X className="h-4 w-4" />
+                    <span className="sr-only">close</span>
+                  </button>
+                </DialogClose>
+              </DialogHeader>
+              <div className="p-4">
+                {renderPanel()}
               </div>
-              {renderPanel()}
-            </CardContent>
-          </Card>
-        );
-      })()}
+            </>
+          )}
+        </DialogContent>
+      </Dialog>
 
     </div>
   );

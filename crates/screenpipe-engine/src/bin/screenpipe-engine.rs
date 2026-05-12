@@ -403,6 +403,46 @@ async fn main() -> anyhow::Result<()> {
                         let s = re_unix.replace_all(s, "~").to_string();
                         re_win.replace_all(&s, "~").to_string()
                     }
+
+                    // Noise filter: drop events whose root cause is a user
+                    // environment problem we can't fix from code. Mirrors the
+                    // Tauri-app filter in apps/screenpipe-app-tauri/src-tauri/
+                    // src/main.rs — the CLI binary was missing the same
+                    // suppression so the events kept flowing in (CLI-49
+                    // alone hit 744 users on stale builds).
+                    static USER_ENV_PATTERNS: std::sync::OnceLock<Vec<regex::Regex>> =
+                        std::sync::OnceLock::new();
+                    let env_patterns = USER_ENV_PATTERNS.get_or_init(|| {
+                        [
+                            // User hasn't granted screen recording permission (CLI-49)
+                            r"Screen recording permission denied",
+                            // Local DB corruption — user dropped/restored part of their db.sqlite
+                            r"no such table: main\.speaker_embeddings",
+                            // Concurrent DB access / user ran CLI while app was running
+                            r"database is locked",
+                            // Broken Homebrew install — external dylib missing
+                            r"Library not loaded.*libx265\.",
+                            // Linux system library missing — distro-local, not our bug
+                            r"Failed to load ayatana-appindicator3 or appindicator3 dynamic library",
+                            // Deepgram DNS / connectivity blips — already logged locally
+                            r"deepgram transcription failed: Cannot resolve audio transcription server",
+                        ]
+                        .into_iter()
+                        .filter_map(|p| regex::Regex::new(p).ok())
+                        .collect()
+                    });
+                    let matches_noise = |text: &str| env_patterns.iter().any(|re| re.is_match(text));
+                    if event.message.as_deref().map(matches_noise).unwrap_or(false) {
+                        return None;
+                    }
+                    for val in event.exception.values.iter() {
+                        if let Some(ref v) = val.value {
+                            if matches_noise(v) {
+                                return None;
+                            }
+                        }
+                    }
+
                     if let Some(ref mut msg) = event.message {
                         *msg = strip_user_paths(msg);
                     }
@@ -1493,6 +1533,13 @@ async fn main() -> anyhow::Result<()> {
     // Spawn the async PII reconciliation worker (issue #3185).
     // Off by default — only runs when `--async-pii-redaction` is set.
     // The capture path is unaffected either way.
+    if !record_args.async_pii_redaction {
+        info!(
+            "text-PII worker skipped at startup — async_pii_redaction=false. \
+             OPF model (~2.8 GB) will NOT be downloaded or loaded. \
+             Toggle via Settings → Privacy → AI PII removal."
+        );
+    }
     if record_args.async_pii_redaction {
         use screenpipe_redact::{
             adapters::{
@@ -1528,8 +1575,16 @@ async fn main() -> anyhow::Result<()> {
             );
             let pipeline = match OpfAdapter::load_or_download(OpfConfig::default()).await {
                 Ok(adapter) => {
-                    info!("text-PII AI step: local opf-rs (candle)");
-                    let ai: Arc<dyn Redactor> = Arc::new(adapter);
+                    info!(
+                        "text-PII AI step: local opf-rs (candle) — lazy load on first \
+                         batch, idle-unload after 60s of no work"
+                    );
+                    // Wrap in Arc first so we can spawn the idle
+                    // unloader (which needs `Arc<Self>`) and still
+                    // hand the same Arc to the Pipeline.
+                    let adapter = Arc::new(adapter);
+                    let _unloader = Arc::clone(&adapter).spawn_idle_unloader();
+                    let ai: Arc<dyn Redactor> = adapter;
                     Pipeline::regex_then_ai(ai, PipelineConfig::default())
                 }
                 Err(e) => {
@@ -1567,6 +1622,13 @@ async fn main() -> anyhow::Result<()> {
     // Independent of the text worker — users can toggle either one
     // without the other. Requires the rfdetr_v9 model present and at
     // least one of the `onnx-*` or `mlx-mac` cargo features built.
+    if !record_args.async_image_pii_redaction {
+        info!(
+            "image-PII worker skipped at startup — async_image_pii_redaction=false. \
+             rfdetr_v9 model (~108 MB) will NOT be downloaded or loaded. \
+             Toggle via Settings → Privacy → AI PII removal."
+        );
+    }
     if record_args.async_image_pii_redaction {
         use screenpipe_redact::adapters::rfdetr::{RfdetrConfig, RfdetrRedactor};
         use screenpipe_redact::image::worker::{ImageWorker, ImageWorkerConfig};
@@ -1596,7 +1658,13 @@ async fn main() -> anyhow::Result<()> {
                 match RfdetrMlxRedactor::load(mlx_cfg) {
                     Ok(d) => {
                         info!("image-PII detector: rfdetr-mlx (Apple Silicon GPU)");
-                        detector_arc = Some(Arc::new(d) as Arc<dyn ImageRedactor>);
+                        // Lazy-load + 60 s idle-unload — frees the
+                        // ~150–200 MB MLX resident footprint when the
+                        // worker is paused or the reconciliation queue
+                        // has drained. Same pattern as OpfAdapter.
+                        let d = Arc::new(d);
+                        let _ = Arc::clone(&d).spawn_idle_unloader();
+                        detector_arc = Some(d as Arc<dyn ImageRedactor>);
                     }
                     Err(e) => {
                         tracing::info!(
