@@ -277,8 +277,9 @@ export default function RootLayout({
             box-shadow: none !important;
             padding: 0 !important;
             cursor: pointer !important;
-            transition: width 0.3s ease, border-radius 0.3s ease, background 0.2s !important;
+            transition: width 0.3s ease, height 0.3s ease, border-radius 0.3s ease, background 0.2s !important;
             display: flex !important;
+            flex-direction: column !important;
             align-items: center !important;
             justify-content: center !important;
           }
@@ -301,29 +302,57 @@ export default function RootLayout({
             font-size: 0 !important;
           }
           #translate:hover {
-            width: 100px !important;
+            width: auto !important;
+            height: auto !important;
+            min-width: 130px !important;
             border-radius: 11px !important;
             background: rgba(0,0,0,0.55) !important;
-            padding: 0 8px !important;
+            padding: 6px 8px !important;
           }
           #translate:hover::before { display: none !important; }
           #translate:hover select {
             opacity: 1 !important;
             position: relative !important;
+            width: 100% !important;
+            height: auto !important;
             font-size: 12px !important;
             background: transparent !important;
             color: #fff !important;
             border: none !important;
             outline: none !important;
-            padding: 0 !important;
+            padding: 2px 0 !important;
           }
           #translate select option { color: #000 !important; background: #fff !important; }
-          .dark #translate {
-            background: rgba(255,255,255,0.1) !important;
+          #sp-translate-toggle {
+            display: none !important;
+            width: 100% !important;
+            height: 16px !important;
+            border-radius: 8px !important;
+            border: none !important;
+            cursor: pointer !important;
+            font-size: 9px !important;
+            line-height: 16px !important;
+            text-align: center !important;
+            padding: 0 !important;
+            flex-shrink: 0 !important;
+            margin-top: 4px !important;
+            background: rgba(255,255,255,0.12) !important;
+            color: rgba(255,255,255,0.6) !important;
+            transition: background 0.2s, color 0.2s !important;
           }
-          .dark #translate:hover {
+          #sp-translate-toggle:hover {
             background: rgba(255,255,255,0.2) !important;
+            color: #fff !important;
           }
+          #sp-translate-toggle.active {
+            background: rgba(59,130,246,0.55) !important;
+            color: #fff !important;
+          }
+          #translate:hover #sp-translate-toggle { display: block !important; }
+          .dark #translate { background: rgba(255,255,255,0.1) !important; }
+          .dark #translate:hover { background: rgba(255,255,255,0.2) !important; }
+          .dark #sp-translate-toggle { background: rgba(255,255,255,0.1) !important; }
+          .dark #sp-translate-toggle.active { background: rgba(59,130,246,0.5) !important; }
         `}} />
         <script src="https://res.zvo.cn/translate/translate.js" defer></script>
         <script
@@ -337,6 +366,48 @@ export default function RootLayout({
                   var msg = String(e.reason && e.reason.message || e.reason || '');
                   if (msg.indexOf('translate') !== -1 || msg.indexOf('Translation') !== -1) { e.preventDefault(); }
                 });
+                var SP_TRANS_KEY = 'sp_translate_on';
+                var SP_LANG_KEY = 'sp_translate_lang';
+                function isTranslateOn() {
+                  var v = localStorage.getItem(SP_TRANS_KEY);
+                  return v === null || v === 'true';
+                }
+                function setTranslateOn(on) {
+                  localStorage.setItem(SP_TRANS_KEY, on ? 'true' : 'false');
+                }
+                function getSavedLang() {
+                  return localStorage.getItem(SP_LANG_KEY) || 'chinese_simplified';
+                }
+                function saveLang(lang) {
+                  localStorage.setItem(SP_LANG_KEY, lang);
+                }
+                function createToggleButton() {
+                  var el = document.getElementById('translate');
+                  if (!el || document.getElementById('sp-translate-toggle')) return;
+                  var btn = document.createElement('button');
+                  btn.id = 'sp-translate-toggle';
+                  btn.title = isTranslateOn() ? 'disable translation' : 'enable translation';
+                  btn.textContent = isTranslateOn() ? 'ON' : 'OFF';
+                  if (isTranslateOn()) btn.classList.add('active');
+                  btn.addEventListener('click', function(e) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    var on = !isTranslateOn();
+                    setTranslateOn(on);
+                    btn.textContent = on ? 'ON' : 'OFF';
+                    btn.title = on ? 'disable translation' : 'enable translation';
+                    btn.classList.toggle('active', on);
+                    if (on) {
+                      var lang = getSavedLang();
+                      translate.changeLanguage(lang);
+                      var sel = document.getElementById('translateSelectLanguage');
+                      if (sel) sel.value = lang;
+                    } else {
+                      location.reload();
+                    }
+                  });
+                  el.appendChild(btn);
+                }
                 function initTranslate() {
                   if (typeof translate === 'undefined') {
                     setTimeout(initTranslate, 500);
@@ -348,12 +419,28 @@ export default function RootLayout({
                       var isReload = translate.to != null && translate.to.length > 0;
                       if(!isReload){
                         var language = event.target.value;
+                        saveLang(language);
                         translate.changeLanguage(language);
+                        setTranslateOn(true);
+                        var btn = document.getElementById('sp-translate-toggle');
+                        if(btn){ btn.textContent='ON'; btn.title='disable translation'; btn.classList.add('active'); }
                       }
                     };
                     translate.service.use('client.edge');
                     translate.listener.start();
                     translate.execute();
+                    if (isTranslateOn()) {
+                      var lang = getSavedLang();
+                      setTimeout(function(){
+                        translate.changeLanguage(lang);
+                        var sel = document.getElementById('translateSelectLanguage');
+                        if (sel) sel.value = lang;
+                      }, 500);
+                    }
+                    setTimeout(createToggleButton, 1000);
+                    setInterval(function() {
+                      if (!document.getElementById('sp-translate-toggle')) createToggleButton();
+                    }, 3000);
                   } catch(e) {
                     console.warn('[translate] init error:', e);
                   }
