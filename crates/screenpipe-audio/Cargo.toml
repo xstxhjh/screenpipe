@@ -17,9 +17,22 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 oasgen = { workspace = true }
 
-# Cross-platform audio capture
-# Using fork with unified cidre version (compatible with sck-rs)
-cpal = { git = "https://github.com/divanshu-go/screenpipe-cpal.git", rev = "070548661878f0aac2d1c2ba445ef2d6ed18705f" }
+# Cross-platform audio capture.
+# Pinned to screenpipe/cpal@1be10a9d (cpal 0.15.3) — the rev we ran
+# in production for months prior to the May 7 fork swap (PR #3257).
+# That swap brought in cpal 0.18 via divanshu-go/screenpipe-cpal,
+# which inherited cpal upstream PR #1097's WASAPI AUTOCONVERTPCM
+# changes. On Windows 11 24H2 those changes cause Communications-class
+# USB mics to deliver silent capture (Jabra Evolve 75, Logi C270 HD,
+# etc.) — same mic records normal speech via DirectShow at -3 dB
+# peak but at -85 dB via WASAPI. See:
+# https://github.com/RustAudio/cpal/issues/1200
+#
+# Tradeoff: we lose the divanshu fork's macOS Voice Processing I/O
+# AEC feature (added 2026-05-06). It hasn't been wired into a user-
+# visible toggle yet, so reverting is no-op for end users while
+# restoring Windows capture across the board.
+cpal = { git = "https://github.com/screenpipe/cpal.git", rev = "1be10a9d67ac7e6b9e0225d2d67ec56058a7dba2" }
 
 # Wav encoding
 hound = "3.5"
@@ -110,7 +123,6 @@ ort = { version = "=2.0.0-rc.10", features = [
   "download-binaries",
   "copy-dylibs",
 ] }
-esaxx-rs = "0.1.10"
 samplerate = { version = "0.2.4" }
 libsamplerate-sys = "0.1.10"
 
@@ -118,7 +130,6 @@ libsamplerate-sys = "0.1.10"
 [target.'cfg(all(target_os = "windows", target_arch = "aarch64"))'.dependencies]
 ort = { version = "=2.0.0-rc.10", default-features = false, features = ["load-dynamic"] }
 ort-sys = { version = "=2.0.0-rc.10", default-features = false }
-esaxx-rs = "0.1.10"
 samplerate = { version = "0.2.4" }
 libsamplerate-sys = "0.1.10"
 

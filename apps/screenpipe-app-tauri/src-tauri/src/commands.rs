@@ -338,6 +338,55 @@ pub async fn set_api_auth_key(key: String) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// Toggle the "Cloud audio + video + image analysis" capability
+/// in the screenpipe-api skill that Pi installs on every run.
+///
+/// Mechanism: the screenpipe-core `Pi::ensure_screenpipe_skill` reads
+/// `~/.screenpipe/cloud_media_analysis.disabled` at install time and
+/// conditionally appends the Gemma 4 E4B confidential-enclave section
+/// to `<project>/.pi/skills/screenpipe-api/SKILL.md`. Default (no
+/// marker) = enabled. This command just creates or removes the marker.
+///
+/// Why a marker file instead of editing the rendered skill: Pi rewrites
+/// the rendered skill from a compiled-in template on every run, so any
+/// post-install edits get overwritten on the next pipe execution. The
+/// only stable seam is at install time.
+///
+/// Idempotent. Effect takes hold on the next Pi run (next pipe
+/// execution or new pi-chat session).
+#[tauri::command]
+#[specta::specta]
+pub fn set_cloud_media_analysis_skill(enabled: bool) -> Result<(), String> {
+    let home = dirs::home_dir().ok_or_else(|| "no home directory".to_string())?;
+    let dir = home.join(".screenpipe");
+    let marker = dir.join("cloud_media_analysis.disabled");
+
+    if enabled {
+        // Default = enabled. Remove any marker file from a prior opt-out.
+        if marker.exists() {
+            std::fs::remove_file(&marker)
+                .map_err(|e| format!("remove {}: {e}", marker.display()))?;
+        }
+    } else {
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("create {}: {e}", dir.display()))?;
+        std::fs::write(
+            &marker,
+            "Opt-out marker — Pi will install the screenpipe-api skill \
+             without the Gemma 4 E4B confidential-enclave block. \
+             Delete this file (or toggle in Settings → Privacy) to \
+             re-enable cloud audio/video/image analysis.\n",
+        )
+        .map_err(|e| format!("write {}: {e}", marker.display()))?;
+    }
+    info!(
+        "cloud media analysis {} (marker: {})",
+        if enabled { "enabled" } else { "disabled" },
+        marker.display()
+    );
+    Ok(())
+}
+
 /// Read the enterprise license key from `enterprise.json`.
 /// Checks in order:
 /// 1. Next to executable (pushed via Intune/MDM to Program Files / .app bundle)

@@ -431,12 +431,242 @@ function GridDissolveLoader({
   );
 }
 
+// Pulls /search query params out of a curl-style bash command so the chat row
+// can show "Searched ChatGPT 'foo'" instead of the raw curl URL. Pi's pipes
+// emit these as plain bash tool calls (no MCP), with the app name encoded as
+// app_name=X in the query string — see crates/screenpipe-core/assets/pipes/.
+interface SearchInfo {
+  appName?: string;
+  windowName?: string;
+  query?: string;
+  contentType?: string;
+}
+function parseSearchCommand(cmd: string): SearchInfo | null {
+  if (!cmd) return null;
+  const m = cmd.match(/https?:\/\/[^\s'"`]+\/search\?[^\s'"`]+/);
+  if (!m) return null;
+  try {
+    const url = new URL(m[0]);
+    if (!url.pathname.endsWith("/search")) return null;
+    const sp = url.searchParams;
+    const out: SearchInfo = {
+      appName: sp.get("app_name") || undefined,
+      windowName: sp.get("window_name") || undefined,
+      query: sp.get("q") || undefined,
+      contentType: sp.get("content_type") || undefined,
+    };
+    if (!out.appName && !out.windowName && !out.query && !out.contentType) return null;
+    return out;
+  } catch {
+    return null;
+  }
+}
+
+// Reads the JSON payload from a `-d '<json>'` (or --data / --data-raw)
+// argument of a curl command. Single-quoted is the common shape in pi's
+// pipes; double-quoted with backslash-escaped inner quotes is the fallback.
+function curlBodyJson(cmd: string): any | null {
+  let m = cmd.match(/(?:-d|--data(?:-raw|-binary)?)\s+'((?:[^'\\]|\\.)*)'/s);
+  let raw = m ? m[1] : null;
+  if (!raw) {
+    m = cmd.match(/(?:-d|--data(?:-raw|-binary)?)\s+"((?:[^"\\]|\\.)*)"/s);
+    raw = m ? m[1].replace(/\\"/g, '"') : null;
+  }
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch {}
+  try { return JSON.parse(raw.replace(/\\'/g, "'")); } catch {}
+  return null;
+}
+
+function curlMethod(cmd: string): string {
+  const m = cmd.match(/-X\s+([A-Z]+)/);
+  return m ? m[1].toUpperCase() : "GET";
+}
+
+function trunc(s: string, n: number): string {
+  return s.length > n ? s.slice(0, n) + "…" : s;
+}
+
+function sqlTables(sql: string): string[] {
+  const out = new Set<string>();
+  const re = /(?:FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_]*)/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(sql)) !== null) out.add(m[1].toLowerCase());
+  return Array.from(out);
+}
+
+function sqlVerb(sql: string): string {
+  const s = sql.trim().toUpperCase();
+  if (s.startsWith("SELECT")) {
+    if (/^\s*SELECT\s+COUNT\s*\(/i.test(sql.trim())) return "Counted";
+    return "Queried";
+  }
+  if (s.startsWith("WITH")) return "Queried";
+  if (s.startsWith("INSERT")) return "Inserted into";
+  if (s.startsWith("UPDATE")) return "Updated";
+  if (s.startsWith("DELETE")) return "Deleted from";
+  return "Ran SQL on";
+}
+
+interface CurlPresentation {
+  label: string;
+  appName?: string;
+}
+
+// Maps pi's bash curl calls to the local screenpipe API into a human label.
+// Pi only emits raw curl (no MCP), so the action lives in the URL + body —
+// every endpoint family pi actually uses (sampled from ~/.pi/agent/sessions)
+// gets its own rewrite here. Unknown endpoints fall back to "<METHOD> <path>".
+function classifyCurl(cmd: string): CurlPresentation | null {
+  if (!cmd) return null;
+
+  const search = parseSearchCommand(cmd);
+  if (search) {
+    const target = search.appName || search.windowName || search.contentType || "recordings";
+    const q = search.query ? ` "${trunc(search.query, 40)}"` : "";
+    return { label: `Searched ${target}${q}`, appName: search.appName || search.windowName };
+  }
+
+  const urlMatch = cmd.match(/https?:\/\/[^\s'"`]+/);
+  if (!urlMatch) return null;
+  let url: URL;
+  try { url = new URL(urlMatch[0]); } catch { return null; }
+  if (!url.host.includes("localhost:3030") && !url.host.includes("127.0.0.1:3030")) return null;
+
+  const method = curlMethod(cmd);
+  const path = url.pathname.replace(/\/$/, "") || "/";
+
+  if (path === "/raw_sql") {
+    const body = curlBodyJson(cmd);
+    const sql = body && typeof body.query === "string" ? body.query : null;
+    if (!sql) return { label: "Ran SQL" };
+    const tables = sqlTables(sql);
+    const verb = sqlVerb(sql);
+    if (tables.length === 0) return { label: verb };
+    if (tables.length === 1) return { label: `${verb} ${tables[0]}` };
+    return { label: `${verb} ${tables.slice(0, 2).join(" + ")}${tables.length > 2 ? " +…" : ""}` };
+  }
+
+  if (path === "/activity-summary") return { label: "Activity summary" };
+
+  if (path === "/memories") {
+    if (method === "POST") return { label: "Saved memory" };
+    return { label: "Listed memories" };
+  }
+  const memMatch = path.match(/^\/memories\/(\w+)$/);
+  if (memMatch) {
+    const id = memMatch[1];
+    if (method === "PATCH" || method === "PUT") return { label: `Updated memory #${id}` };
+    if (method === "DELETE") return { label: `Deleted memory #${id}` };
+    return { label: `Got memory #${id}` };
+  }
+
+  if (path === "/meetings") return { label: "Listed meetings" };
+  const meetingMatch = path.match(/^\/meetings\/(\w+)$/);
+  if (meetingMatch) {
+    const id = meetingMatch[1];
+    if (method === "PATCH" || method === "PUT") {
+      const body = curlBodyJson(cmd);
+      const hasTitle = body && typeof body.title === "string" && body.title.length > 0;
+      const hasNote = body && typeof body.note === "string" && body.note.length > 0;
+      if (hasTitle && hasNote) return { label: `Renamed + summarized meeting #${id}` };
+      if (hasNote) return { label: `Summarized meeting #${id}` };
+      if (hasTitle) return { label: `Renamed meeting #${id}` };
+      return { label: `Updated meeting #${id}` };
+    }
+    if (method === "DELETE") return { label: `Deleted meeting #${id}` };
+    return { label: `Got meeting #${id}` };
+  }
+
+  if (path === "/speakers/similar") {
+    const name = url.searchParams.get("name") || url.searchParams.get("speaker_name");
+    return { label: name ? `Found similar speakers for "${trunc(name, 30)}"` : "Found similar speakers" };
+  }
+  if (path === "/speakers/merge") return { label: "Merged speakers" };
+  if (path === "/speakers/search") {
+    const q = url.searchParams.get("name") || url.searchParams.get("q");
+    return { label: q ? `Searched speakers "${trunc(q, 30)}"` : "Searched speakers" };
+  }
+  if (path === "/speakers/unnamed") return { label: "Listed unnamed speakers" };
+  if (path.startsWith("/speakers/")) {
+    const id = path.split("/")[2];
+    if (method === "PATCH" || method === "PUT") return { label: `Renamed speaker #${id}` };
+    return { label: `Got speaker #${id}` };
+  }
+
+  if (path === "/connections/browsers/owned-default/navigate") {
+    const body = curlBodyJson(cmd);
+    if (body && typeof body.url === "string") {
+      try {
+        const u = new URL(body.url);
+        return { label: `Navigated agent browser → ${u.host}` };
+      } catch {}
+    }
+    return { label: "Navigated agent browser" };
+  }
+  if (path === "/connections/browsers/owned-default/eval") return { label: "Ran JS in agent browser" };
+  if (path.startsWith("/connections/browsers/")) return { label: "Agent browser action" };
+
+  if (path === "/connections") return { label: "Listed connections" };
+  if (path.startsWith("/connections/")) {
+    const name = path.split("/")[2];
+    if (method === "DELETE") return { label: `Removed ${name} connection` };
+    if (method === "POST" || method === "PATCH" || method === "PUT") return { label: `Configured ${name} connection` };
+    return { label: `${name} connection` };
+  }
+
+  if (path === "/pipes") {
+    if (method === "POST") return { label: "Installed pipe" };
+    return { label: "Listed pipes" };
+  }
+  const pipeMatch = path.match(/^\/pipes\/([^/]+)(?:\/(.+))?$/);
+  if (pipeMatch) {
+    const name = pipeMatch[1];
+    const sub = pipeMatch[2];
+    if (sub === "executions") return { label: `${name}: recent runs` };
+    if (sub === "run" || method === "POST") return { label: `Ran pipe ${name}` };
+    if (method === "PATCH" || method === "PUT") return { label: `Configured pipe ${name}` };
+    if (method === "DELETE") return { label: `Removed pipe ${name}` };
+    return { label: `Pipe ${name}` };
+  }
+
+  if (path === "/frames/export") return { label: "Exported video" };
+  if (path === "/health") return { label: "Health check" };
+  if (path === "/list-monitors") return { label: "Listed monitors" };
+  if (path === "/list-audio-devices") return { label: "Listed audio devices" };
+  if (path === "/tags") return { label: "Listed tags" };
+
+  return { label: `${method} ${path}` };
+}
+
+function extractAppFromToolCall(toolCall: ToolCall): string | undefined {
+  if (toolCall.toolName === "bash") {
+    return classifyCurl(String(toolCall.args?.command ?? ""))?.appName;
+  }
+  return undefined;
+}
+
 // Human-friendly label for a tool call (no JSON, no raw paths)
 function friendlyToolLabel(toolCall: ToolCall): string {
   const fileName = (p: string) => p.split("/").pop() || p;
   switch (toolCall.toolName) {
-    case "bash":
-      return `Ran ${toolCall.args.command ? `\`${String(toolCall.args.command).slice(0, 60)}${String(toolCall.args.command).length > 60 ? "…" : ""}\`` : "command"}`;
+    case "bash": {
+      const cmd = String(toolCall.args.command ?? "");
+      const result = classifyCurl(cmd);
+      if (result) return result.label;
+      // Fallback for non-API curls / arbitrary shell — strip the auth-header
+      // boilerplate so the truncation surfaces the meaningful tail, not the
+      // 80-char "-H Authorization: Bearer $SCREENPIPE_API_AUTH_KEY" header.
+      const stripped = cmd
+        .replace(/^\s*curl\s+/, "curl ")
+        .replace(/\s-s\s+/g, " ")
+        .replace(/\s-H\s+['"]Authorization:\s*Bearer\s+\$?SCREENPIPE_API_AUTH_KEY['"]\s*/g, " ")
+        .replace(/\s-H\s+['"]Content-Type:\s*application\/json['"]\s*/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+      const display = stripped || cmd;
+      return `Ran ${display ? `\`${display.slice(0, 60)}${display.length > 60 ? "…" : ""}\`` : "command"}`;
+    }
     case "read":
       return `Read ${fileName(toolCall.args.path || "")}`;
     case "edit":
@@ -494,6 +724,7 @@ function FriendlyToolDetails({ toolCall }: { toolCall: ToolCall }) {
 function ToolCallRailItem({ toolCall, isLast }: { toolCall: ToolCall; isLast: boolean }) {
   const [expanded, setExpanded] = useState(false);
   const label = friendlyToolLabel(toolCall);
+  const appName = extractAppFromToolCall(toolCall);
 
   return (
     <div className="relative flex min-w-0">
@@ -533,6 +764,9 @@ function ToolCallRailItem({ toolCall, isLast }: { toolCall: ToolCall; isLast: bo
           onClick={() => setExpanded(!expanded)}
           className="w-full flex items-center gap-1.5 text-left min-w-0 group py-0.5"
         >
+          {appName && (
+            <AppIcon name={appName} sizeClass="w-3.5 h-3.5" letterClass="text-[8px]" />
+          )}
           <span className="truncate flex-1 text-xs font-mono text-foreground/70 group-hover:text-foreground transition-colors duration-150">
             {label}
           </span>
@@ -629,15 +863,65 @@ function formatMinutes(minutes: number): string {
   return m > 0 ? `${h}h ${m}m` : `${h}h`;
 }
 
-function AppIcon({ name }: { name: string }) {
+// Static fallback for web/SaaS apps the OS won't give us via /app-icon. Keys
+// are normalized (trim + lowercase, .app/.exe stripped). Paths point at the
+// existing assets in apps/screenpipe-app-tauri/public/images/.
+const STATIC_APP_ICONS: Record<string, string> = {
+  chatgpt: "/images/openai.png",
+  openai: "/images/openai.png",
+  claude: "/images/claude-ai.svg",
+  "claude.ai": "/images/claude-ai.svg",
+  anthropic: "/images/anthropic.png",
+  perplexity: "/images/perplexity.svg",
+  ollama: "/images/ollama.png",
+  "lm studio": "/images/lmstudio.png",
+  lmstudio: "/images/lmstudio.png",
+  msty: "/images/msty.webp",
+  anythingllm: "/images/anythingllm.png",
+  safari: "/images/safari.svg",
+  notion: "/images/notion.svg",
+  github: "/images/github.png",
+  copilot: "/images/github.png",
+  "github copilot": "/images/github.png",
+  linear: "/images/linear.svg",
+  asana: "/images/asana.svg",
+  jira: "/images/jira.png",
+  hubspot: "/images/hubspot.png",
+  monday: "/images/monday.png",
+  "google calendar": "/images/google-calendar.svg",
+  "google docs": "/images/google-docs.svg",
+  "google sheets": "/images/google-sheets.svg",
+  whatsapp: "/images/whatsapp.svg",
+  resend: "/images/resend.svg",
+  limitless: "/images/limitless.svg",
+  granola: "/images/granola.png",
+  fireflies: "/images/fireflies.png",
+  otter: "/images/otter.png",
+  bee: "/images/bee.png",
+  airtable: "/images/airtable.png",
+  apple: "/images/apple.svg",
+  "apple intelligence": "/images/apple-intelligence.png",
+  screenpipe: "/images/screenpipe.png",
+};
+
+function normalizeAppKey(name: string): string {
+  return name.trim().toLowerCase().replace(/\.app$|\.exe$/i, "");
+}
+
+function AppIcon({
+  name,
+  sizeClass = "w-5 h-5",
+  letterClass = "text-[10px]",
+}: { name: string; sizeClass?: string; letterClass?: string }) {
   const color = nameToColor(name);
   const [iconFailed, setIconFailed] = React.useState(false);
-  const iconUrl = `http://localhost:11435/app-icon?name=${encodeURIComponent(name)}`;
+  const staticPath = STATIC_APP_ICONS[normalizeAppKey(name)];
+  const iconUrl = staticPath ?? `http://localhost:11435/app-icon?name=${encodeURIComponent(name)}`;
   return (
-    <div className="w-5 h-5 rounded-sm flex-shrink-0 flex items-center justify-center overflow-hidden">
+    <div className={cn("rounded-sm flex-shrink-0 flex items-center justify-center overflow-hidden", sizeClass)}>
       {iconFailed ? (
         <span
-          className="w-full h-full flex items-center justify-center text-[10px] font-semibold text-white rounded-sm"
+          className={cn("w-full h-full flex items-center justify-center font-semibold text-white rounded-sm", letterClass)}
           style={{ backgroundColor: color }}
         >
           {name.charAt(0).toUpperCase()}
